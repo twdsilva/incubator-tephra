@@ -19,6 +19,7 @@ package org.apache.tephra.hbase;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
@@ -49,23 +50,29 @@ import org.apache.hadoop.hbase.filter.LongComparator;
 import org.apache.hadoop.hbase.filter.ValueFilter;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.tephra.Transaction;
 import org.apache.tephra.TransactionConflictException;
 import org.apache.tephra.TransactionContext;
 import org.apache.tephra.TransactionManager;
 import org.apache.tephra.TransactionSystemClient;
 import org.apache.tephra.TxConstants;
+import org.apache.tephra.TxConstants.ConflictDetection;
 import org.apache.tephra.hbase.coprocessor.TransactionProcessor;
 import org.apache.tephra.inmemory.InMemoryTxSystemClient;
 import org.apache.tephra.metrics.TxMetricsCollector;
+import org.apache.tephra.persist.HDFSTransactionStateStorage;
 import org.apache.tephra.persist.InMemoryTransactionStateStorage;
 import org.apache.tephra.persist.TransactionStateStorage;
+import org.apache.tephra.snapshot.SnapshotCodecProvider;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.ClassRule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -100,6 +107,15 @@ public class TransactionAwareHTableTest {
   private TransactionContext transactionContext;
   private TransactionAwareHTable transactionAwareHTable;
   private HTable hTable;
+  
+  @ClassRule
+  public static TemporaryFolder tmpFolder = new TemporaryFolder();
+  
+  private static MiniDFSCluster dfsCluster;
+  
+  public static void tearDownAfterClass() throws Exception {
+    dfsCluster.shutdown();
+  }
 
   private static final class TestBytes {
     private static final byte[] table = Bytes.toBytes("testtable");
@@ -148,6 +164,14 @@ public class TransactionAwareHTableTest {
   public static void setupBeforeClass() throws Exception {
     testUtil = new HBaseTestingUtility();
     conf = testUtil.getConfiguration();
+    
+    conf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR, tmpFolder.newFolder().getAbsolutePath());
+    dfsCluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    
+    conf.unset(TxConstants.Manager.CFG_TX_HDFS_USER);
+    conf.set(TxConstants.Manager.CFG_TX_SNAPSHOT_DIR, tmpFolder.newFolder().getAbsolutePath());
+    
+    conf.setLong(TxConstants.Manager.CFG_TX_SNAPSHOT_INTERVAL, 5);
 
     // Tune down the connection thread pool size
     conf.setInt("hbase.hconnection.threads.core", 5);
@@ -163,7 +187,7 @@ public class TransactionAwareHTableTest {
 
     testUtil.startMiniCluster();
     hBaseAdmin = testUtil.getHBaseAdmin();
-    txStateStorage = new InMemoryTransactionStateStorage();
+    txStateStorage = new HDFSTransactionStateStorage(conf, new SnapshotCodecProvider(conf), new TxMetricsCollector());
     txManager = new TransactionManager(conf, txStateStorage, new TxMetricsCollector());
     txManager.startAndWait();
   }
@@ -295,7 +319,7 @@ public class TransactionAwareHTableTest {
       result = txTable.get(new Get(TestBytes.row));
       txContext.finish();
       assertTrue(result.isEmpty());
-
+      
       // test column delete
       // load 10 rows
       txContext.start();
@@ -446,6 +470,75 @@ public class TransactionAwareHTableTest {
         hTable.close();
       }
     }
+  
+  @Test
+  public void testFamilyDeleteWithCompaction() throws Exception {
+    HTable hTable = createTable(Bytes.toBytes("TestFamilyDeleteWithCompaction"),
+                                new byte[][]{TestBytes.family, TestBytes.family2});
+    try {
+      TransactionAwareHTable txTable = new TransactionAwareHTable(hTable, ConflictDetection.ROW);
+      TransactionContext txContext = new TransactionContext(new InMemoryTxSystemClient(txManager), txTable);
+            
+      txContext.start();
+      Put put = new Put(TestBytes.row);
+      put.add(TestBytes.family, TestBytes.qualifier, TestBytes.value);
+      txTable.put(put);
+      
+      put = new Put(TestBytes.row2);
+      put.add(TestBytes.family, TestBytes.qualifier, TestBytes.value);
+      txTable.put(put);
+      txContext.finish();
+      
+      txContext.start();
+      Result result = txTable.get(new Get(TestBytes.row));
+      txContext.finish();
+      assertFalse(result.isEmpty());
+      
+      txContext.start();
+      // test family delete with ConflictDetection.ROW (as ConflictDetection.COLUMN converts this to a column delete)
+      Delete delete = new Delete(TestBytes.row);
+      delete.deleteFamily(TestBytes.family);
+      txTable.delete(delete);
+      txContext.finish();
+      
+      txContext.start();
+      result = txTable.get(new Get(TestBytes.row));
+      txContext.finish();
+      assertTrue(result.isEmpty());
+      
+      boolean compactionDone = false;
+      int count = 0;
+      while (count++ < 12 && !compactionDone) {
+         // run major compaction and verify the row was removed
+         HBaseAdmin hbaseAdmin = testUtil.getHBaseAdmin();
+         hbaseAdmin.flush("TestFamilyDeleteWithCompaction");
+         hbaseAdmin.majorCompact("TestFamilyDeleteWithCompaction");
+         hbaseAdmin.close();
+         Thread.sleep(5000L);
+         
+         Scan scan = new Scan();
+         scan.setStartRow(TestBytes.row);
+         scan.setStopRow(Bytes.add(TestBytes.row, new byte[] { 0 }));
+         scan.setRaw(true);
+         
+         ResultScanner scanner = hTable.getScanner(scan);
+         compactionDone = scanner.next() == null;
+         scanner.close();
+      }
+      assertTrue("Compaction should have removed the row", compactionDone);
+      
+      Scan scan = new Scan();
+      scan.setStartRow(TestBytes.row2);
+      scan.setStopRow(Bytes.add(TestBytes.row2, new byte[] { 0 }));
+      scan.setRaw(true);
+      
+      ResultScanner scanner = hTable.getScanner(scan);
+      Result res = scanner.next();
+      assertNotNull(res);
+      } finally {
+        hTable.close();
+      }
+  }
   
   /**
    * Test aborted transactional delete requests, that must be rolled back.
